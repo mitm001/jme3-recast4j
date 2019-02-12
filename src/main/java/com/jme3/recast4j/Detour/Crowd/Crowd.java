@@ -1,6 +1,7 @@
 package com.jme3.recast4j.Detour.Crowd;
 
 import com.jme3.bullet.control.BetterCharacterControl;
+import com.jme3.math.Quaternion;
 import com.jme3.math.Vector3f;
 import com.jme3.recast4j.Detour.BetterDefaultQueryFilter;
 import com.jme3.recast4j.Detour.DetourUtils;
@@ -27,7 +28,7 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
     protected TargetProximityDetector proximityDetector;
     protected FormationHandler formationHandler;
     protected NavMeshQuery m_navquery;
-    protected boolean[] formationInProgress;
+    protected Vector3f[] formationTargets;
 
     public Crowd(MovementApplicationType applicationType, int maxAgents, float maxAgentRadius, NavMesh nav)
             throws NoSuchFieldException, IllegalAccessException {
@@ -43,11 +44,23 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
         spatialMap = new Spatial[maxAgents];
         proximityDetector = new SimpleTargetProximityDetector(1f);
         formationHandler = new CircleFormationHandler(maxAgents, this, 1f);
-        formationInProgress = new boolean[maxAgents];
+        formationTargets = new Vector3f[maxAgents];
 
         Field f = getClass().getSuperclass().getDeclaredField("m_navquery");
         f.setAccessible(true);
         m_navquery = (NavMeshQuery)f.get(this);
+    }
+
+    public void setApplicationType(MovementApplicationType applicationType) {
+        this.applicationType = applicationType;
+    }
+
+    public void setCustomApplyFunction(ApplyFunction applyFunction) {
+        this.applyFunction = applyFunction;
+    }
+
+    public MovementApplicationType getApplicationType() {
+        return applicationType;
     }
 
     public void update(float deltaTime) {
@@ -138,7 +151,10 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
                 // Debug Code to handle "approaching behavior"
                 System.out.println("" + Boolean.toString(crowdAgent.targetRef != 0) + " speed: " + velocity.length() + " newPos: " + newPos + " velocity: " + velocity);
                 if (velocity.length() > 0.1f) {
+                    Quaternion rotation = new Quaternion();
+                    rotation.lookAt(velocity.normalize(), Vector3f.UNIT_Y);
                     spatialMap[crowdAgent.idx].setLocalTranslation(newPos);
+                    spatialMap[crowdAgent.idx].setLocalRotation(rotation);
                 }
                 break;
 
@@ -146,43 +162,47 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
                 BetterCharacterControl bcc = spatialMap[crowdAgent.idx].getControl(BetterCharacterControl.class);
                 bcc.setWalkDirection(velocity);
                 bcc.setViewDirection(velocity.normalize());
+
+                /* Note: Unfortunately BetterCharacterControl does not expose getPhysicsLocation but it's tied to the
+                 * SceneGraph Position
+                 */
+                if (SimpleTargetProximityDetector.euclideanDistanceSquared(newPos,
+                        spatialMap[crowdAgent.idx].getWorldTranslation()) > 0.4f * 0.4f) {
+                    /* Note: This should never occur but when collisions happen, they happen. Let's hope we can get away
+                     * with that even though DtCrowd documentation explicitly states that one should not move agents
+                     * constantly (okay, we only do it in rare cases, but still). Bugs could appear when some internal
+                     * state is voided. The most clean solution would be removeAgent(), addAgent() but that has some
+                     * overhead as well as possibly messing with the index one which some 3rd-party code might rely on.
+                      */
+                    System.out.println("Resetting Agent because of physics drift");
+                    DetourUtils.fillFloatArray(crowdAgent.npos, spatialMap[crowdAgent.idx].getWorldTranslation());
+                }
                 break;
 
             default:
                 throw new IllegalArgumentException("Unknown Application Type");
         }
 
-        // alternative: crowdAgent.targetPos != formationHandler.getTargetPosition(). But better not rely on these impls
-        // and what if formation's targetPosition might change?
-        if (!formationInProgress[crowdAgent.idx]) {
-            //@TODO: Instead of targetRef, expose targetState [which means create a WrapperClass soon]
-            if (crowdAgent.targetRef != 0 && proximityDetector.isInTargetProximity(crowdAgent, newPos,
+        // If we aren't currently forming.
+        if (formationTargets[crowdAgent.idx] == null) {
+            if (isMoving(crowdAgent) && proximityDetector.isInTargetProximity(crowdAgent, newPos,
                     DetourUtils.createVector3f(crowdAgent.targetPos))) {
                 // Handle Crowd Agent in proximity.
                 resetMoveTarget(crowdAgent.idx); // Make him stop moving.
-                formationHandler.moveIntoFormation(crowdAgent);
-                formationInProgress[crowdAgent.idx] = true;
+                formationTargets[crowdAgent.idx] = formationHandler.moveIntoFormation(crowdAgent);
+                // It's up to moveIntoFormation to make the agent move, we could however also design the API so we just
+                // use the return value for this. Then it would be less prone to user error. On the other hand the
+                // "do" something pattern is more implicative than "getFormationPosition"
+            } else {
+                // @TODO: Stuck detection?
             }
         } else {
-            /*
-             @TODO: crowdAgent.targetPos... Unreliable, crowd should track them, together in one variable
-             with formationInProgress. Maybe also as part of the formationHandler!
-            */
-            if (SimpleTargetProximityDetector.euclideanDistanceSquared(crowdAgent, newPos,
-                    DetourUtils.createVector3f(crowdAgent.targetPos)) < 0.1f * 0.1f) {
-                formationInProgress[crowdAgent.idx] = false;
-                resetMoveTarget(crowdAgent.idx);
+            if (SimpleTargetProximityDetector.euclideanDistanceSquared(newPos,
+                    formationTargets[crowdAgent.idx]) < 0.1f * 0.1f) {
+                resetMoveTarget(crowdAgent.idx); // does formationTargets[crowdAgent.idx] = null; for us
                 System.out.println("Reached Target");
             }
         }
-    }
-
-    public void setApplicationType(MovementApplicationType applicationType) {
-        this.applicationType = applicationType;
-    }
-
-    public void setCustomApplyFunction(ApplyFunction applyFunction) {
-        this.applyFunction = applyFunction;
     }
 
     /**
@@ -195,6 +215,7 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
      * @return whether this operation was successful
      */
     public boolean requestMoveToTarget(CrowdAgent crowdAgent, Vector3f to) {
+        // @TODO: m_navquery.getQueryExtents()?
         FindNearestPolyResult res = m_navquery.findNearestPoly(DetourUtils.toFloatArray(to), new float[]{0.5f, 0.5f, 0.5f}, new BetterDefaultQueryFilter());
         if (res.getNearestRef() != -1) {
             return requestMoveToTarget(crowdAgent, res.getNearestRef(), to);
@@ -212,5 +233,45 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
      */
     public boolean requestMoveToTarget(CrowdAgent crowdAgent, long polyRef, Vector3f to) {
         return requestMoveTarget(crowdAgent.idx, polyRef, DetourUtils.toFloatArray(to));
+    }
+
+    @Override
+    public boolean requestMoveTarget(int idx, long ref, float[] pos) {
+        formationTargets[idx] = null; // Reset formation state.
+        return super.requestMoveTarget(idx, ref, pos);
+    }
+
+    @Override
+    public boolean resetMoveTarget(int idx) {
+        formationTargets[idx] = null;
+        return super.resetMoveTarget(idx);
+    }
+
+    /**
+     * When the Agent is ACTIVE and moving (has a valid target set).
+     * @param crowdAgent The agent to query
+     * @return If the agent is moving
+     */
+    public boolean isMoving(CrowdAgent crowdAgent) {
+        return crowdAgent.active && crowdAgent.targetState == CrowdAgent.MoveRequestState.DT_CROWDAGENT_TARGET_VALID;
+    }
+
+    /**
+     * When the Agent is ACTIVE and has no target (this is not the same as !{@link #isMoving(CrowdAgent)}).
+     * @param crowdAgent The agent to query
+     * @return If the agent has no target
+     */
+    public boolean hasNoTarget(CrowdAgent crowdAgent) {
+        return crowdAgent.active && crowdAgent.targetState == CrowdAgent.MoveRequestState.DT_CROWDAGENT_TARGET_NONE;
+    }
+
+    /**
+     * When the Agent is ACTIVE and moving into a formation (which means he is close enough to his target, by the means
+     * of {@link TargetProximityDetector#isInTargetProximity(CrowdAgent, Vector3f, Vector3f)}
+     * @param crowdAgent The Agent to query
+     * @return If the Agent is forming
+     */
+    public boolean isForming(CrowdAgent crowdAgent) {
+        return crowdAgent.active && formationTargets[crowdAgent.idx] != null;
     }
 }
