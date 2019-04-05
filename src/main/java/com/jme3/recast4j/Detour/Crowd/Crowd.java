@@ -63,6 +63,19 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
         return applicationType;
     }
 
+    public FormationHandler getFormationHandler() {
+        return formationHandler;
+    }
+
+    /**
+     * Sets the Handler which will move the agents into formation when they are close to the target.<br>
+     * Passing null will disable formation.
+     * @param formationHandler The handler to use
+     */
+    public void setFormationHandler(FormationHandler formationHandler) {
+        this.formationHandler = formationHandler;
+    }
+
     public void update(float deltaTime) {
         if (debug) {
             debugInfo = new CrowdAgentDebugInfo(); // Clear.
@@ -111,31 +124,12 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
     }
 
     /**
-     * Makes the whole Crowd move to a target. Know that you can also move individual agents.
-     * @param to The Move Target
-     * @param polyRef The Polygon to which the target belongs
-     * @return Whether all agents could be scheduled to approach the target
-     */
-    public boolean requestMoveToTarget(Vector3f to, long polyRef) {
-        if (polyRef == 0 || to == null) {
-            throw new IllegalArgumentException("Invalid Target (" + to + ", " + polyRef + ")");
-        }
-
-        formationHandler.setTargetPosition(to);
-
-        // Unfortunately ag.setTarget is not an exposed API, maybe we'll write a dispatcher class if that bugs me too much
-        // Why? That way we could throw Exceptions when the index is wrong (IndexOutOfBoundsEx)
-        return getActiveAgents().stream()
-            .allMatch(ca -> requestMoveTarget(ca.idx, polyRef, DetourUtils.toFloatArray(to)));
-        // if all were successful, return true, else return false.
-    }
-
-    /**
      * This method is called by the CrowdManager to move the agents on the screen.
      */
     protected void applyMovements() {
-        getActiveAgents().forEach(ca -> applyMovement(ca, DetourUtils.createVector3f(ca.npos),
-                DetourUtils.createVector3f(ca.vel)));
+        getActiveAgents().stream().filter(this::isMoving)
+            .forEach(ca -> applyMovement(ca, DetourUtils.createVector3f(ca.npos),
+                            DetourUtils.createVector3f(ca.vel)));
     }
 
     protected void applyMovement(CrowdAgent crowdAgent, Vector3f newPos, Vector3f velocity) {
@@ -185,15 +179,21 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
 
         // If we aren't currently forming.
         if (formationTargets[crowdAgent.idx] == null) {
-            if (isMoving(crowdAgent) && proximityDetector.isInTargetProximity(crowdAgent, newPos,
+            if (proximityDetector.isInTargetProximity(crowdAgent, newPos,
                     DetourUtils.createVector3f(crowdAgent.targetPos))) {
                 // Handle Crowd Agent in proximity.
-                resetMoveTarget(crowdAgent.idx); // Make him stop moving.
-                formationTargets[crowdAgent.idx] = formationHandler.moveIntoFormation(crowdAgent);
-                // It's up to moveIntoFormation to make the agent move, we could however also design the API so we just
-                // use the return value for this. Then it would be less prone to user error. On the other hand the
-                // "do" something pattern is more implicative than "getFormationPosition"
+                if (formationHandler != null) {
+                    resetMoveTarget(crowdAgent.idx); // Make him stop moving.
+                    formationTargets[crowdAgent.idx] = formationHandler.moveIntoFormation(crowdAgent);
+                    // It's up to moveIntoFormation to make the agent move, we could however also design the API so we just
+                    // use the return value for this. Then it would be less prone to user error. On the other hand the
+                    // "do" something pattern is more implicative than "getFormationPosition"
+                } else {
+                    resetMoveTarget(crowdAgent.idx); // Make him stop moving.
+                }
+
             } else {
+                System.out.println("not in proximity of " + DetourUtils.createVector3f(crowdAgent.targetPos));
                 // @TODO: Stuck detection?
             }
         } else {
@@ -201,8 +201,49 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
                     formationTargets[crowdAgent.idx]) < 0.1f * 0.1f) {
                 resetMoveTarget(crowdAgent.idx); // does formationTargets[crowdAgent.idx] = null; for us
                 System.out.println("Reached Target");
+            } else {
+                System.out.println("IS FORMING");
             }
         }
+    }
+
+    /**
+     * Makes the whole Crowd move to a target. Know that you can also move individual agents.
+     * @param to The Move Target
+     * @param polyRef The Polygon to which the target belongs
+     * @return Whether all agents could be scheduled to approach the target
+     * @deprecated Will be removed because specifying the polyRef is undesired (as crashes happen
+     * when this value is wrong (e.g. not taken the Filters into account)).
+     */
+    @Deprecated
+    protected boolean requestMoveToTarget(Vector3f to, long polyRef) {
+        if (polyRef == 0 || to == null) {
+            throw new IllegalArgumentException("Invalid Target (" + to + ", " + polyRef + ")");
+        }
+
+        if (formationHandler != null) {
+            formationHandler.setTargetPosition(to);
+        }
+
+        // Unfortunately ag.setTarget is not an exposed API, maybe we'll write a dispatcher class if that bugs me too much
+        // Why? That way we could throw Exceptions when the index is wrong (IndexOutOfBoundsEx)
+        return getActiveAgents().stream()
+                .allMatch(ca -> requestMoveTarget(ca.idx, polyRef, DetourUtils.toFloatArray(to)));
+
+    }
+
+    /**
+     * Makes the whole Crowd move to a target. Know that you can also move individual agents.
+     * @param to The Move Target
+     * @return Whether all agents could be scheduled to approach the target
+     * @see #requestMoveToTarget(CrowdAgent, Vector3f)
+     */
+    public boolean requestMoveToTarget(Vector3f to) {
+        if (formationHandler != null) {
+            formationHandler.setTargetPosition(to);
+        }
+        return getActiveAgents().stream().allMatch(ca -> requestMoveToTarget(ca, to));
+        // if all were successful, return true, else return false.
     }
 
     /**
@@ -215,10 +256,11 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
      * @return whether this operation was successful
      */
     public boolean requestMoveToTarget(CrowdAgent crowdAgent, Vector3f to) {
-        // @TODO: m_navquery.getQueryExtents()?
-        FindNearestPolyResult res = m_navquery.findNearestPoly(DetourUtils.toFloatArray(to), new float[]{0.5f, 0.5f, 0.5f}, new BetterDefaultQueryFilter());
-        if (res.getNearestRef() != -1) {
-            return requestMoveToTarget(crowdAgent, res.getNearestRef(), to);
+        Result<FindNearestPolyResult> res = m_navquery.findNearestPoly(DetourUtils.toFloatArray(to), getQueryExtents(),
+                getFilter(crowdAgent.params.queryFilterType));
+
+        if (res.status.isSuccess() && res.result.getNearestRef() != -1) {
+            return requestMoveTarget(crowdAgent.idx, res.result.getNearestRef(), DetourUtils.toFloatArray(to));
         } else {
             return false;
         }
@@ -230,8 +272,10 @@ public class Crowd extends org.recast4j.detour.crowd.Crowd {
      * @param polyRef The Polygon where the position resides
      * @param to where the agent shall move to
      * @return whether this operation was successful
+     * @deprecated Use non-polRef instead
      */
-    public boolean requestMoveToTarget(CrowdAgent crowdAgent, long polyRef, Vector3f to) {
+    @Deprecated
+    protected boolean requestMoveToTarget(CrowdAgent crowdAgent, long polyRef, Vector3f to) {
         return requestMoveTarget(crowdAgent.idx, polyRef, DetourUtils.toFloatArray(to));
     }
 
